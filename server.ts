@@ -3,6 +3,7 @@ import { nextRequestId } from './ids.ts';
 import { createStore, type Store } from './store.ts';
 import { handleGit } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 import { handleCreateRepo, handleRest } from './rest-repos.ts';
 const store = createStore();
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}): void {
@@ -43,7 +44,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, store: Store)
   } else if (path === '/api/graphql' || path.startsWith('/api/graphql/')) {
     await handleGraphQL(req, res, store); return;
   } else if (path === '/mcp' || path.startsWith('/mcp/')) {
-    // M7: MCP.
+    await handleMcp(req, res, store); return;
   }
   sendJson(res, 404, { message: 'Not Found' });
 }

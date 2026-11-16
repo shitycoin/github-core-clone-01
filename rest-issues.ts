@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { nextSeq } from './clock.ts';
+import { globalId } from './ids.ts';
 import { nextIssueNumber, type Repo } from './store.ts';
 import { paginate, readJson } from './rest.ts';
 import { sendJson } from './server.ts';
@@ -20,7 +21,9 @@ export function addCommentRecord(repo: Repo, issueNumber: number, body: string):
   return comment;
 }
 export const labelJson = (label: { name: string; color?: string }) => ({ name: label.name, color: label.color ?? 'ededed' });
-export const issueJson = (issue: Issue) => ({ number: issue.number, title: issue.title, body: issue.body, state: issue.state, labels: issue.labels.map(name => ({ name })) });
+// M7: REST issue objects carry the same global id GraphQL uses for the issue
+// (checks-mcp rest-parity reads .id off the REST view and requires it stable).
+export const issueJson = (repo: Repo, issue: Issue) => ({ id: globalId('Issue', `${repo.databaseId}:${issue.number}`), number: issue.number, title: issue.title, body: issue.body, state: issue.state, labels: issue.labels.map(name => ({ name })) });
 export const commentJson = (comment: Comment) => ({ id: comment.id, body: comment.body });
 export function sortedIssues(repo: Repo, query: URLSearchParams): Issue[] {
   const state = query.get('state') ?? 'open';
@@ -43,27 +46,27 @@ export async function handleIssues(req: IncomingMessage, res: ServerResponse, re
     sendJson(res, 201, labelJson(label)); return;
   }
   if (tail.length === 1) {
-    if (req.method === 'GET') { list(sortedIssues(repo, url.searchParams).map(issueJson)); return; }
+    if (req.method === 'GET') { list(sortedIssues(repo, url.searchParams).map((issue) => issueJson(repo, issue))); return; }
     if (req.method === 'POST') {
       const fields = await readJson(req, res); if (!fields) return;
       const labels = fields.labels ?? [];
       if (!Array.isArray(labels) || labels.some(name => typeof name !== 'string' || !repo.labels.has(name))) { error(422, 'Unknown label'); return; }
       const issue = createIssueRecord(repo, typeof fields.title === 'string' ? fields.title : '', typeof fields.body === 'string' ? fields.body : '');
       issue.labels = labels;
-      sendJson(res, 201, issueJson(issue)); return;
+      sendJson(res, 201, issueJson(repo, issue)); return;
     }
   } else {
     const issue = repo.issues.get(Number(tail[1])) as Issue | undefined;
     if (!issue) { error(404, 'Not Found'); return; }
     if (tail.length === 2) {
-      if (req.method === 'GET') { sendJson(res, 200, issueJson(issue)); return; }
+      if (req.method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
       if (req.method === 'PATCH') {
         const fields = await readJson(req, res); if (!fields) return;
         if (fields.state !== undefined && fields.state !== 'open' && fields.state !== 'closed') { error(422, 'Invalid state'); return; }
         if (fields.state !== undefined) issue.state = fields.state;
         if (typeof fields.title === 'string') issue.title = fields.title;
         if (typeof fields.body === 'string') issue.body = fields.body;
-        sendJson(res, 200, issueJson(issue)); return;
+        sendJson(res, 200, issueJson(repo, issue)); return;
       }
     } else if (tail[2] === 'comments') {
       if (req.method === 'GET') { list(((repo.comments.get(issue.number) ?? []) as Comment[]).map(commentJson)); return; }
