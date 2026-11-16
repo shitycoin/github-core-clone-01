@@ -1,3 +1,5 @@
+import { handleIssues } from './rest-issues.ts';
+import { handlePulls } from './rest-pulls.ts';
 // The M3 create-repo shim is preserved below; M4 handlers follow it.
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { checkAuth, OWNER_LOGIN } from './auth.ts';
@@ -126,5 +128,13 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
     sendJson(res, 200, tip ? walkCommits(store, tip).map(c => ({ sha: c.sha, commit: { message: c.message } })) : []); return;
   }
   if (tail[0] === 'contents') { await handleContents(req, res, store, repo, tail.slice(1).join('/'), searchParams); return; }
+  if (tail.length === 1 && tail[0] === 'labels' && req.method === 'POST') { await handleIssues(req, res, repo, tail, url); return; }
+  if (tail.length === 1 && tail[0] === 'issues') { await handleIssues(req, res, repo, tail, url); return; }
+  if (tail.length === 2 && tail[0] === 'issues' && /^\d+$/.test(tail[1])) { await handleIssues(req, res, repo, tail, url); return; }
+  if (tail.length === 3 && tail[0] === 'issues' && /^\d+$/.test(tail[1]) && tail[2] === 'comments') { await handleIssues(req, res, repo, tail, url); return; }
+  if (tail.length === 1 && tail[0] === 'pulls') { await handlePulls(req, res, store, repo, tail, url); return; }
+  if (tail.length === 2 && tail[0] === 'pulls' && /^\d+$/.test(tail[1])) { await handlePulls(req, res, store, repo, tail, url); return; }
+  if (tail.length === 3 && tail[0] === 'pulls' && /^\d+$/.test(tail[1]) && tail[2] === 'files') { await handlePulls(req, res, store, repo, tail, url); return; }
+  if (tail.length === 3 && tail[0] === 'pulls' && /^\d+$/.test(tail[1]) && tail[2] === 'merge') { await handlePulls(req, res, store, repo, tail, url); return; }
   notFound(res);
 }
