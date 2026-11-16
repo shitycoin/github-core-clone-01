@@ -2,6 +2,7 @@ import { createServer, type Server, type IncomingMessage, type ServerResponse } 
 import { nextRequestId } from './ids.ts';
 import { createStore, type Store } from './store.ts';
 import { handleGit } from './git-http.ts';
+import { handleGraphQL } from './graphql.ts';
 import { handleCreateRepo, handleRest } from './rest-repos.ts';
 const store = createStore();
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}): void {
@@ -40,7 +41,7 @@ async function dispatch(req: IncomingMessage, res: ServerResponse, store: Store)
     if (method === 'POST' && path === '/api/v3/user/repos') { await handleCreateRepo(req, res, store); return; }
     await handleRest(req, res, store, parsed); return;
   } else if (path === '/api/graphql' || path.startsWith('/api/graphql/')) {
-    // M6: GraphQL.
+    await handleGraphQL(req, res, store); return;
   } else if (path === '/mcp' || path.startsWith('/mcp/')) {
     // M7: MCP.
   }

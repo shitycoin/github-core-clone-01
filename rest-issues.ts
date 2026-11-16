@@ -6,6 +6,19 @@ import { sendJson } from './server.ts';
 
 export interface Issue { number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[]; createdSeq: number }
 export interface Comment { id: number; body: string }
+/** Shared record builders (M6): GraphQL mutations + REST handlers call these, never a second copy. */
+export function createIssueRecord(repo: Repo, title: string, body: string): Issue {
+  const issue: Issue = { number: nextIssueNumber(repo), title, body, state: 'open', labels: [], createdSeq: nextSeq() };
+  repo.issues.set(issue.number, issue);
+  return issue;
+}
+export function closeIssueRecord(issue: Issue): void { issue.state = 'closed'; }
+export function addCommentRecord(repo: Repo, issueNumber: number, body: string): Comment {
+  const comment: Comment = { id: nextSeq(), body };
+  const comments = repo.comments.get(issueNumber) ?? [];
+  comments.push(comment); repo.comments.set(issueNumber, comments);
+  return comment;
+}
 export const labelJson = (label: { name: string; color?: string }) => ({ name: label.name, color: label.color ?? 'ededed' });
 export const issueJson = (issue: Issue) => ({ number: issue.number, title: issue.title, body: issue.body, state: issue.state, labels: issue.labels.map(name => ({ name })) });
 export const commentJson = (comment: Comment) => ({ id: comment.id, body: comment.body });
@@ -35,8 +48,9 @@ export async function handleIssues(req: IncomingMessage, res: ServerResponse, re
       const fields = await readJson(req, res); if (!fields) return;
       const labels = fields.labels ?? [];
       if (!Array.isArray(labels) || labels.some(name => typeof name !== 'string' || !repo.labels.has(name))) { error(422, 'Unknown label'); return; }
-      const issue: Issue = { number: nextIssueNumber(repo), title: typeof fields.title === 'string' ? fields.title : '', body: typeof fields.body === 'string' ? fields.body : '', state: 'open', labels, createdSeq: nextSeq() };
-      repo.issues.set(issue.number, issue); sendJson(res, 201, issueJson(issue)); return;
+      const issue = createIssueRecord(repo, typeof fields.title === 'string' ? fields.title : '', typeof fields.body === 'string' ? fields.body : '');
+      issue.labels = labels;
+      sendJson(res, 201, issueJson(issue)); return;
     }
   } else {
     const issue = repo.issues.get(Number(tail[1])) as Issue | undefined;
@@ -56,10 +70,7 @@ export async function handleIssues(req: IncomingMessage, res: ServerResponse, re
       if (req.method === 'POST') {
         const fields = await readJson(req, res); if (!fields) return;
         if (typeof fields.body !== 'string') { error(422, 'body is required'); return; }
-        const comment: Comment = { id: nextSeq(), body: fields.body };
-        const comments = repo.comments.get(issue.number) ?? [];
-        comments.push(comment); repo.comments.set(issue.number, comments);
-        sendJson(res, 201, commentJson(comment)); return;
+        sendJson(res, 201, commentJson(addCommentRecord(repo, issue.number, fields.body))); return;
       }
     }
   }

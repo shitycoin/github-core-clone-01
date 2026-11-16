@@ -29,8 +29,40 @@ export function lineDiff(oldText: string, newText: string) {
   const common = row[newLines.length], additions = newLines.length - common, deletions = oldLines.length - common;
   return { additions, deletions, changes: additions + deletions };
 }
-export const hasConflict = (baseBlob: string | undefined, tipBlob: string | undefined, headBlob: string | undefined) =>
-  tipBlob !== baseBlob && headBlob !== baseBlob && headBlob !== tipBlob;
+export function hasConflict(baseBlob: string | undefined, tipBlob: string | undefined, headBlob: string | undefined): boolean {
+  return tipBlob !== baseBlob && headBlob !== baseBlob && headBlob !== tipBlob;
+}
+/** Shared record builders (M6): GraphQL mutations + REST handlers call these, never a second copy. */
+export function createPullRecord(store: Store, repo: Repo, head: string, base: string, title: string, body: string): Pull {
+  const headShaAtCreate = getRef(repo, `refs/heads/${head}`), baseShaAtCreate = getRef(repo, `refs/heads/${base}`);
+  if (!head || !base || !headShaAtCreate || !baseShaAtCreate || getObject(store, headShaAtCreate)?.type !== 'commit' || getObject(store, baseShaAtCreate)?.type !== 'commit') throw new Error('Invalid branch');
+  const pull: Pull = { number: nextPullNumber(repo), state: 'open', title, body, head, base, headShaAtCreate, baseShaAtCreate, merged: false, merged_at: null, merge_commit_sha: null };
+  repo.pulls.set(pull.number, pull);
+  return pull;
+}
+/** Squash-merge onto the base branch. Throws 'Pull request is not open' / 'Base branch is missing' / 'Merge conflict'. */
+export function mergePullRecord(store: Store, repo: Repo, pull: Pull): { sha: string } {
+  if (pull.state !== 'open') throw new Error('Pull request is not open');
+  const tip = getRef(repo, `refs/heads/${pull.base}`);
+  if (!tip) throw new Error('Base branch is missing');
+  const base = readFiles(store, readCommit(store, pull.baseShaAtCreate).tree);
+  const headModes = new Map<string, string>(), modes = new Map<string, string>();
+  const head = readFiles(store, readCommit(store, pull.headShaAtCreate).tree, headModes);
+  const files = readFiles(store, readCommit(store, tip).tree, modes);
+  const changed = [...new Set([...base.keys(), ...head.keys()])].filter(path => base.get(path) !== head.get(path));
+  for (const path of changed) {
+    if (hasConflict(base.get(path), files.get(path), head.get(path))) throw new Error('Merge conflict');
+  }
+  for (const path of changed) {
+    const blob = head.get(path);
+    if (blob === undefined) { files.delete(path); modes.delete(path); }
+    else { files.set(path, blob); modes.set(path, headModes.get(path)!); }
+  }
+  const message = `Merge pull request #${pull.number} from ${pull.head}`;
+  const sha = commitFiles(store, repo, pull.base, files, message, modes);
+  pull.state = 'closed'; pull.merged = true; pull.merged_at = timestampForCreation().iso; pull.merge_commit_sha = sha;
+  return { sha };
+}
 export function pullFiles(store: Store, pull: Pull) {
   const base = readFiles(store, readCommit(store, pull.baseShaAtCreate).tree);
   const head = readFiles(store, readCommit(store, pull.headShaAtCreate).tree);
@@ -56,10 +88,10 @@ export async function handlePulls(req: IncomingMessage, res: ServerResponse, sto
     if (req.method === 'POST') {
       const fields = await readJson(req, res); if (!fields) return;
       const head = typeof fields.head === 'string' ? fields.head : '', base = typeof fields.base === 'string' ? fields.base : '';
-      const headShaAtCreate = getRef(repo, `refs/heads/${head}`), baseShaAtCreate = getRef(repo, `refs/heads/${base}`);
-      if (!head || !base || !headShaAtCreate || !baseShaAtCreate || getObject(store, headShaAtCreate)?.type !== 'commit' || getObject(store, baseShaAtCreate)?.type !== 'commit') { error(422, 'Invalid branch'); return; }
-      const pull: Pull = { number: nextPullNumber(repo), state: 'open', title: typeof fields.title === 'string' ? fields.title : '', body: typeof fields.body === 'string' ? fields.body : '', head, base, headShaAtCreate, baseShaAtCreate, merged: false, merged_at: null, merge_commit_sha: null };
-      repo.pulls.set(pull.number, pull); sendJson(res, 201, pullJson(pull)); return;
+      let pull: Pull;
+      try { pull = createPullRecord(store, repo, head, base, typeof fields.title === 'string' ? fields.title : '', typeof fields.body === 'string' ? fields.body : ''); }
+      catch { error(422, 'Invalid branch'); return; }
+      sendJson(res, 201, pullJson(pull)); return;
     }
   } else {
     const pull = repo.pulls.get(Number(tail[1])) as Pull | undefined;
@@ -68,27 +100,15 @@ export async function handlePulls(req: IncomingMessage, res: ServerResponse, sto
     if (tail[2] === 'files' && req.method === 'GET') { list(pullFiles(store, pull)); return; }
     if (tail[2] === 'merge' && req.method === 'PUT') {
       const fields = await readJson(req, res); if (!fields) return;
-      if (pull.state !== 'open') { error(405, 'Pull request is not open'); return; }
       if (fields.merge_method !== undefined && fields.merge_method !== 'squash') { error(422, 'Only squash merge is supported'); return; }
-      const tip = getRef(repo, `refs/heads/${pull.base}`);
-      if (!tip) { error(405, 'Base branch is missing'); return; }
-      const base = readFiles(store, readCommit(store, pull.baseShaAtCreate).tree);
-      const headModes = new Map<string, string>(), modes = new Map<string, string>();
-      const head = readFiles(store, readCommit(store, pull.headShaAtCreate).tree, headModes);
-      const files = readFiles(store, readCommit(store, tip).tree, modes);
-      const changed = [...new Set([...base.keys(), ...head.keys()])].filter(path => base.get(path) !== head.get(path));
-      for (const path of changed) {
-        if (hasConflict(base.get(path), files.get(path), head.get(path))) { error(405, 'Merge conflict'); return; }
+      let sha: string;
+      try { ({ sha } = mergePullRecord(store, repo, pull)); }
+      catch (err) {
+        const message = err instanceof Error ? err.message : '';
+        if (message === 'Pull request is not open' || message === 'Base branch is missing' || message === 'Merge conflict') { error(405, message); return; }
+        throw err;
       }
-      for (const path of changed) {
-        const blob = head.get(path);
-        if (blob === undefined) { files.delete(path); modes.delete(path); }
-        else { files.set(path, blob); modes.set(path, headModes.get(path)!); }
-      }
-      const message = `Merge pull request #${pull.number} from ${pull.head}`;
-      const sha = commitFiles(store, repo, pull.base, files, message, modes);
-      pull.state = 'closed'; pull.merged = true; pull.merged_at = timestampForCreation().iso; pull.merge_commit_sha = sha;
-      sendJson(res, 200, { merged: true, sha, message }); return;
+      sendJson(res, 200, { merged: true, sha, message: `Merge pull request #${pull.number} from ${pull.head}` }); return;
     }
   }
   error(404, 'Not Found');
