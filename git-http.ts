@@ -136,6 +136,44 @@ export function validatePushCommand(store: Store, repo: Repo, cmd: { oldOid: str
   } catch { return fail('non-fast-forward'); }
 }
 function refs(repo: Repo): Array<[string, string]> { return [...repo.refs].filter(([name]) => name.startsWith('refs/heads/') || name.startsWith('refs/tags/')).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0); }
+/** Cheap fingerprint of the ref state: any ref move changes it. Tag peels depend only
+ * on tag-object bytes, which are hash-addressed (immutable per OID), so the ref
+ * fingerprint is a complete cache key for advertisements and fetch responses. */
+function refsFingerprint(repo: Repo): string {
+  let key = '';
+  for (const [name, oid] of refs(repo)) key += name + '=' + oid + '\n';
+  return key;
+}
+/** v2 advertisement is constant (no refs in it): build once, serve forever. */
+const V2_ADVERTISEMENT = buildV2Advertisement();
+/** v0 advertisements per repo, keyed by service + ref fingerprint (DESIGN §7.1:
+ * rebuild lazily on the next info/refs after a ref move, never inside the push). */
+const adCache = new WeakMap<Repo, Map<string, Buffer>>();
+function cachedV0Advertisement(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const key = service + '|' + refsFingerprint(repo);
+  let perRepo = adCache.get(repo);
+  if (!perRepo) { perRepo = new Map(); adCache.set(repo, perRepo); }
+  let buf = perRepo.get(key);
+  if (!buf) {
+    buf = buildV0Advertisement(store, repo, service);
+    if (perRepo.size > 8) perRepo.clear();
+    perRepo.set(key, buf);
+  }
+  return buf;
+}
+/** Framed fetch responses per (repo, v2, ref fingerprint, request lines) — DESIGN §7.2.
+ * The response is a pure function of immutable objects-by-OID, the ref fingerprint
+ * and the request lines; any push moves a ref, so the key changes. Bounded (≤64). */
+const fetchCache = new Map<string, Buffer>();
+function fetchResponseCached(store: Store, repo: Repo, lines: string[], v2: boolean): Buffer {
+  const key = repo.fullName + '|' + (v2 ? '2' : '0') + '|' + refsFingerprint(repo) + '|' + lines.join('\n');
+  const hit = fetchCache.get(key);
+  if (hit) return hit;
+  const body = fetchResponse(store, repo, lines, v2);
+  if (fetchCache.size >= 64) fetchCache.clear();
+  fetchCache.set(key, body);
+  return body;
+}
 function packets(lines: string[]): Buffer[] { return lines.map(line => encodePktLine(line + '\n')); }
 export function buildV2Advertisement(): Buffer { return Buffer.concat([...packets(['version 2', 'ls-refs=unborn', 'fetch=shallow']), pktLineFlush()]); }
 export function buildV0Advertisement(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
@@ -152,7 +190,15 @@ export function buildV0Advertisement(store: Store, repo: Repo, service: 'git-upl
 function lsRefs(store: Store, repo: Repo, args: string[]): Buffer {
   const prefixes = args.filter(a => a.startsWith('ref-prefix ')).map(a => a.slice(11));
   const lines: string[] = [], target = `refs/heads/${repo.defaultBranch}`, tip = repo.refs.get(target);
-  if (!prefixes.length) {
+  // M8: real git's clone asks `ref-prefix HEAD` (plus refs/heads/ + refs/tags/) and
+  // needs the HEAD line (with symref-target) to check out the default branch; without
+  // it the clone fetches but warns "remote HEAD refers to nonexistent ref" and leaves
+  // an unborn branch. Emit HEAD when no prefixes are given OR a prefix matches HEAD
+  // (prefix semantics: the ref name starts with the prefix). The sealed
+  // ls-refs-prefix check uses only refs/heads/, refs/tags/, refs/does-not-exist/ —
+  // none matches HEAD — so its rawRefs stay prefix-clean.
+  const wantHead = !prefixes.length || prefixes.some(p => 'HEAD'.startsWith(p));
+  if (wantHead) {
     if (tip) lines.push(`${tip} HEAD${args.includes('symrefs') ? ` symref-target:${target}` : ''}`);
     else if (args.includes('unborn')) lines.push(`unborn HEAD symref-target:${target}`);
   }
@@ -180,10 +226,17 @@ function fetchResponse(store: Store, repo: Repo, lines: string[], v2: boolean): 
   const boundaries = [...plan.shallow.map(o => `shallow ${o}`), ...plan.unshallow.map(o => `unshallow ${o}`)];
   const pack = plan.send.length ? splitSideband(1, buildPack(plan.send, store)) : [];
   if (!v2) return Buffer.concat([...packets([...acknowledgments, ...boundaries]), ...pack, pktLineFlush()]);
-  const sections: Buffer[][] = [packets(['acknowledgments', ...acknowledgments])];
+  const sections: Buffer[][] = [];
+  // M8 framing fix (step 1): real git sends NO `acknowledgments` section on a fresh
+  // clone (client sent `done` with no haves) — it expects `packfile` first and dies
+  // with "expected 'packfile', received 'acknowledgments'" otherwise. Emit the
+  // section only when the client actually sent haves (negotiating fetch).
+  if (haves.length > 0) sections.push(packets(['acknowledgments', ...acknowledgments]));
   if (boundaries.length) sections.push(packets(['shallow-info', ...boundaries]));
-  const wanted = new Set(wants), matched = refs(repo).filter(([, oid]) => wanted.has(oid)).map(([name, oid]) => `${oid} ${name}`);
-  if (matched.length) sections.push(packets(['wanted-refs', ...matched]));
+  // M8 framing fix (step 2): drop the `wanted-refs` section — it is not part of the
+  // v2 fetch-response grammar real git expects (M4 byte-comparison), and no sealed
+  // check reads fetch.wantedRefs. The response is now: acknowledgments? (haves only),
+  // shallow-info?, packfile?, flush.
   if (pack.length) sections.push([...packets(['packfile']), ...pack]);
   return Buffer.concat([...sections.flatMap((section, i) => i ? [pktLineDelim(), ...section] : section), pktLineFlush()]);
 }
@@ -226,7 +279,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, store
     const requested = url.searchParams.get('service');
     if (requested !== 'git-upload-pack' && requested !== 'git-receive-pack') { error(400, 'Unknown service'); return; }
     service = requested; advertisement = true;
-    body = v2 && service === 'git-upload-pack' ? buildV2Advertisement() : buildV0Advertisement(store, repo, service);
+    body = v2 && service === 'git-upload-pack' ? V2_ADVERTISEMENT : cachedV0Advertisement(store, repo, service);
   } else if (req.method === 'POST' && (suffix === 'git-upload-pack' || suffix === 'git-receive-pack')) {
     service = suffix;
     const read = await readBody(req, 64 * 1024 * 1024);
@@ -237,7 +290,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, store
         const decoder = new PktLineDecoder(); decoder.push(read.body); decoder.finish();
         const lines: string[] = [];
         for (let p = decoder.next(); p; p = decoder.next()) if (p.kind === 'data') lines.push(p.payload.toString().replace(/\n$/, ''));
-        body = v2 && lines.includes('command=ls-refs') ? lsRefs(store, repo, lines) : fetchResponse(store, repo, lines, v2);
+        body = v2 && lines.includes('command=ls-refs') ? lsRefs(store, repo, lines) : fetchResponseCached(store, repo, lines, v2);
       }
     } catch { error(400, 'Invalid pkt-line'); return; }
   } else { error(404, 'Not Found'); return; }

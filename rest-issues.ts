@@ -3,9 +3,9 @@ import { nextSeq } from './clock.ts';
 import { globalId } from './ids.ts';
 import { nextIssueNumber, type Repo } from './store.ts';
 import { paginate, readJson } from './rest.ts';
-import { sendJson } from './server.ts';
+import { sendJson, sendJsonBuf } from './server.ts';
 
-export interface Issue { number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[]; createdSeq: number }
+export interface Issue { number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[]; createdSeq: number; jsonBuf?: Buffer }
 export interface Comment { id: number; body: string }
 /** Shared record builders (M6): GraphQL mutations + REST handlers call these, never a second copy. */
 export function createIssueRecord(repo: Repo, title: string, body: string): Issue {
@@ -13,7 +13,7 @@ export function createIssueRecord(repo: Repo, title: string, body: string): Issu
   repo.issues.set(issue.number, issue);
   return issue;
 }
-export function closeIssueRecord(issue: Issue): void { issue.state = 'closed'; }
+export function closeIssueRecord(issue: Issue): void { issue.state = 'closed'; issue.jsonBuf = undefined; }
 export function addCommentRecord(repo: Repo, issueNumber: number, body: string): Comment {
   const comment: Comment = { id: nextSeq(), body };
   const comments = repo.comments.get(issueNumber) ?? [];
@@ -24,6 +24,14 @@ export const labelJson = (label: { name: string; color?: string }) => ({ name: l
 // M7: REST issue objects carry the same global id GraphQL uses for the issue
 // (checks-mcp rest-parity reads .id off the REST view and requires it stable).
 export const issueJson = (repo: Repo, issue: Issue) => ({ id: globalId('Issue', `${repo.databaseId}:${issue.number}`), number: issue.number, title: issue.title, body: issue.body, state: issue.state, labels: issue.labels.map(name => ({ name })) });
+/** Pre-serialised REST representation (DESIGN §7.3): built once, served as bytes on
+ * every read; dropped whenever the issue mutates (PATCH handler, closeIssueRecord).
+ * The buffer includes sendJson's trailing newline, so it is byte-identical to the
+ * uncached reply. Labels are only ever set at creation, before the first build. */
+export function issueJsonBuf(repo: Repo, issue: Issue): Buffer {
+  if (!issue.jsonBuf) issue.jsonBuf = Buffer.from(JSON.stringify(issueJson(repo, issue)) + '\n');
+  return issue.jsonBuf;
+}
 export const commentJson = (comment: Comment) => ({ id: comment.id, body: comment.body });
 export function sortedIssues(repo: Repo, query: URLSearchParams): Issue[] {
   const state = query.get('state') ?? 'open';
@@ -53,20 +61,21 @@ export async function handleIssues(req: IncomingMessage, res: ServerResponse, re
       if (!Array.isArray(labels) || labels.some(name => typeof name !== 'string' || !repo.labels.has(name))) { error(422, 'Unknown label'); return; }
       const issue = createIssueRecord(repo, typeof fields.title === 'string' ? fields.title : '', typeof fields.body === 'string' ? fields.body : '');
       issue.labels = labels;
-      sendJson(res, 201, issueJson(repo, issue)); return;
+      sendJsonBuf(res, 201, issueJsonBuf(repo, issue)); return;
     }
   } else {
     const issue = repo.issues.get(Number(tail[1])) as Issue | undefined;
     if (!issue) { error(404, 'Not Found'); return; }
     if (tail.length === 2) {
-      if (req.method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return; }
+      if (req.method === 'GET') { sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return; }
       if (req.method === 'PATCH') {
         const fields = await readJson(req, res); if (!fields) return;
         if (fields.state !== undefined && fields.state !== 'open' && fields.state !== 'closed') { error(422, 'Invalid state'); return; }
         if (fields.state !== undefined) issue.state = fields.state;
         if (typeof fields.title === 'string') issue.title = fields.title;
         if (typeof fields.body === 'string') issue.body = fields.body;
-        sendJson(res, 200, issueJson(repo, issue)); return;
+        issue.jsonBuf = undefined;
+        sendJsonBuf(res, 200, issueJsonBuf(repo, issue)); return;
       }
     } else if (tail[2] === 'comments') {
       if (req.method === 'GET') { list(((repo.comments.get(issue.number) ?? []) as Comment[]).map(commentJson)); return; }

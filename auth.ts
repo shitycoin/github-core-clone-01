@@ -114,14 +114,15 @@ export function generateUsers(rng: Rng, count: number): ScenarioUser[] {
 export function computeOwnerLogin(): string { return generateUsers(scenarioRng('users'), 12)[0].login; }
 export const OWNER_LOGIN = computeOwnerLogin();
 export const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+const SHOP_TOKEN_BUF = SHOP_TOKEN ? Buffer.from(SHOP_TOKEN) : null;
 export function checkAuth(req: IncomingMessage): boolean {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) return false;
   const token = header.slice(7);
   // Dev-only fallback; trials always configure SHOP_TOKEN.
-  if (!SHOP_TOKEN) return token.length > 0;
-  const actual = Buffer.from(token), expected = Buffer.from(SHOP_TOKEN);
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
+  if (!SHOP_TOKEN_BUF) return token.length > 0;
+  const actual = Buffer.from(token);
+  return actual.length === SHOP_TOKEN_BUF.length && timingSafeEqual(actual, SHOP_TOKEN_BUF);
 }
 // M4: foreign owners return 404, never 403.
 export function isOwner(owner: string): boolean { return owner === OWNER_LOGIN; }

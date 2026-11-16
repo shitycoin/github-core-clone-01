@@ -11,6 +11,12 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
   res.writeHead(status, { ...headers, 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(text), 'X-GitHub-Request-Id': nextRequestId() });
   res.end(text);
 }
+/** Byte-identical reply to sendJson for a pre-serialised buffer (trailing newline
+ * included by the builder): same headers, no per-request JSON.stringify. */
+export function sendJsonBuf(res: ServerResponse, status: number, buf: Buffer, headers: Record<string,string> = {}): void {
+  res.writeHead(status, { ...headers, 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length, 'X-GitHub-Request-Id': nextRequestId() });
+  res.end(buf);
+}
 export type BodyResult = { ok: true; body: Buffer; overCap: false } | { ok: false; overCap: boolean };
 /** Drains oversized bodies without retaining bytes or destroying keep-alive. */
 export function readBody(req: IncomingMessage, cap = 1024 * 1024): Promise<BodyResult> {
@@ -21,7 +27,7 @@ export function readBody(req: IncomingMessage, cap = 1024 * 1024): Promise<BodyR
       if (size > cap) { overCap = true; chunks.length = 0; }
       else if (!overCap) chunks.push(chunk);
     });
-    req.on('end', () => resolve(overCap ? { ok: false, overCap: true } : { ok: true, body: Buffer.concat(chunks), overCap: false }));
+    req.on('end', () => resolve(overCap ? { ok: false, overCap: true } : { ok: true, body: chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks), overCap: false }));
     req.on('error', () => resolve({ ok: false, overCap }));
     req.on('aborted', () => resolve({ ok: false, overCap }));
   });
