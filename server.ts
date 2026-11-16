@@ -1,6 +1,8 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { nextRequestId } from './ids.ts';
 import { createStore, type Store } from './store.ts';
+import { handleGit } from './git-http.ts';
+import { handleCreateRepo } from './rest-repos.ts';
 const store = createStore();
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}): void {
   const text = JSON.stringify(body) + '\n';
@@ -22,7 +24,7 @@ export function readBody(req: IncomingMessage, cap = 1024 * 1024): Promise<BodyR
     req.on('aborted', () => resolve({ ok: false, overCap }));
   });
 }
-function dispatch(req: IncomingMessage, res: ServerResponse, _store: Store): void {
+async function dispatch(req: IncomingMessage, res: ServerResponse, store: Store): Promise<void> {
   let path: string;
   try { path = new URL(req.url ?? '/', 'http://entry').pathname; } catch { path = ''; }
   const method = req.method ?? '';
@@ -30,11 +32,12 @@ function dispatch(req: IncomingMessage, res: ServerResponse, _store: Store): voi
   const ownerEnd = path.indexOf('/', 1);
   const repoEnd = path.indexOf('/', ownerEnd + 1);
   if (ownerEnd > 1 && repoEnd > ownerEnd + 1 && path.slice(ownerEnd + 1, repoEnd).endsWith('.git')) {
-    // M3: git smart HTTP.
+    await handleGit(req, res, store, decodeURIComponent(path.slice(1, ownerEnd)), decodeURIComponent(path.slice(ownerEnd + 1, repoEnd - 4))); return;
   } else if (path === '/api/v3' || path.startsWith('/api/v3/')) {
     if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
       sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' }); return;
     }
+    if (method === 'POST' && path === '/api/v3/user/repos') { await handleCreateRepo(req, res, store); return; }
     // M4/M5: REST.
   } else if (path === '/api/graphql' || path.startsWith('/api/graphql/')) {
     // M6: GraphQL.
@@ -46,8 +49,8 @@ function dispatch(req: IncomingMessage, res: ServerResponse, _store: Store): voi
 export function createApp(): Server {
   return createServer((req, res) => {
     req.on('error', () => {});
-    try { dispatch(req, res, store); }
-    catch { if (!res.headersSent && !res.destroyed) sendJson(res, 500, { message: 'Internal Server Error' }); }
-    req.resume();
+    void dispatch(req, res, store).catch(() => {
+      if (!res.headersSent && !res.destroyed) sendJson(res, 500, { message: 'Internal Server Error' });
+    }).finally(() => { req.resume(); });
   });
 }
