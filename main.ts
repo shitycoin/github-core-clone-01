@@ -1,3 +1,9 @@
+// Entry for the git forge built in this repo.
+// This process serves the whole forge: the git wire protocol, the v3 REST API,
+// the GraphQL schema, and the MCP tools — everything createApp() assembles in
+// app.ts. main.ts itself only starts that app and then follows the harness
+// lifecycle: pick a free port, announce it, and wait until the env says done.
+//
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
